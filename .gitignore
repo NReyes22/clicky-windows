@@ -1,0 +1,29 @@
+## .NET / Visual Studio
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+
+## Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+
+## NuGet
+**/packages/*
+*.nupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+## Debug logs
+clicky-debug.log
+
+## IDE
+.idea/
+*.swp
+*~

@@ -1,0 +1,34 @@
+<Window x:Class="ClickyWindows.Views.OverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:ClickyWindows.Controls"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ShowActivated="False"
+        ResizeMode="NoResize">
+
+    <Canvas x:Name="OverlayCanvas">
+        <!-- Blue cursor triangle -->
+        <controls:BlueCursorControl x:Name="BlueCursor"
+                                    Canvas.Left="0" Canvas.Top="0"
+                                    Visibility="Visible"/>
+
+        <!-- Waveform (visible during Listening state) -->
+        <controls:WaveformControl x:Name="Waveform"
+                                  Canvas.Left="0" Canvas.Top="0"
+                                  Visibility="Collapsed"/>
+
+        <!-- Spinner (visible during Processing state) -->
+        <controls:SpinnerControl x:Name="Spinner"
+                                 Canvas.Left="0" Canvas.Top="0"
+                                 Visibility="Collapsed"/>
+
+        <!-- Speech bubble (visible during Responding/Pointing) -->
+        <controls:SpeechBubbleControl x:Name="SpeechBubble"
+                                      Canvas.Left="0" Canvas.Top="0"
+                                      Visibility="Collapsed"/>
+    </Canvas>
+</Window>
