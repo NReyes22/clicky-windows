@@ -163,9 +163,9 @@ public partial class OverlayWindow : Window
 
     private void UpdateControlPositions(double x, double y)
     {
-        // Position the active control at the cursor location
-        Canvas.SetLeft(BlueCursor, x - 8);
-        Canvas.SetTop(BlueCursor, y - 8);
+        // Position the blue cursor offset below and to the right of the real mouse cursor
+        Canvas.SetLeft(BlueCursor, x + 16);
+        Canvas.SetTop(BlueCursor, y + 16);
 
         Canvas.SetLeft(Waveform, x - 20);
         Canvas.SetTop(Waveform, y - 12);
