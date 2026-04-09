@@ -14,6 +14,11 @@ public enum ShortcutTransition
 /// Monitors for the global Ctrl+Alt push-to-talk shortcut using a low-level keyboard hook.
 /// Port of GlobalPushToTalkShortcutMonitor.swift — detects modifier-only press/release
 /// transitions system-wide, even when the app is in the background.
+///
+/// IMPORTANT: We track key state ourselves rather than using GetAsyncKeyState, because
+/// GetAsyncKeyState lags one event behind inside a WH_KEYBOARD_LL hook callback —
+/// it reports the state BEFORE the current event, not after. This caused the shortcut
+/// to only "activate" on key-up and immediately deactivate.
 /// </summary>
 public class GlobalHotkeyService : IDisposable
 {
@@ -22,6 +27,12 @@ public class GlobalHotkeyService : IDisposable
     private IntPtr hookId = IntPtr.Zero;
     private NativeMethods.LowLevelKeyboardProc? hookProc;
     private bool isShortcutActive;
+
+    // Track modifier key state ourselves — GetAsyncKeyState is unreliable inside hooks
+    private bool lCtrlDown;
+    private bool rCtrlDown;
+    private bool lAltDown;
+    private bool rAltDown;
 
     public void Start()
     {
@@ -58,39 +69,51 @@ public class GlobalHotkeyService : IDisposable
             var vkCode = hookStruct.vkCode;
             var messageType = wParam.ToInt32();
 
-            // We only care about Ctrl and Alt key events
-            bool isCtrlOrAlt = vkCode is NativeMethods.VK_LCONTROL or NativeMethods.VK_RCONTROL
-                                     or NativeMethods.VK_LMENU or NativeMethods.VK_RMENU;
+            bool isKeyDown = messageType is NativeMethods.WM_KEYDOWN or NativeMethods.WM_SYSKEYDOWN;
+            bool isKeyUp = messageType is NativeMethods.WM_KEYUP or NativeMethods.WM_SYSKEYUP;
 
-            if (isCtrlOrAlt)
+            if (isKeyDown || isKeyUp)
             {
-                bool isKeyDown = messageType is NativeMethods.WM_KEYDOWN or NativeMethods.WM_SYSKEYDOWN;
-                bool isKeyUp = messageType is NativeMethods.WM_KEYUP or NativeMethods.WM_SYSKEYUP;
-
-                if (isKeyDown || isKeyUp)
+                // Update our own key state tracking based on the current event
+                switch (vkCode)
                 {
-                    // Check if both Ctrl and Alt are currently held
-                    bool ctrlHeld = (NativeMethods.GetAsyncKeyState(NativeMethods.VK_LCONTROL) & 0x8000) != 0
-                                 || (NativeMethods.GetAsyncKeyState(NativeMethods.VK_RCONTROL) & 0x8000) != 0;
-                    bool altHeld = (NativeMethods.GetAsyncKeyState(NativeMethods.VK_LMENU) & 0x8000) != 0
-                                || (NativeMethods.GetAsyncKeyState(NativeMethods.VK_RMENU) & 0x8000) != 0;
+                    case NativeMethods.VK_LCONTROL:
+                        lCtrlDown = isKeyDown;
+                        break;
+                    case NativeMethods.VK_RCONTROL:
+                        rCtrlDown = isKeyDown;
+                        break;
+                    case NativeMethods.VK_LMENU:
+                        lAltDown = isKeyDown;
+                        break;
+                    case NativeMethods.VK_RMENU:
+                        rAltDown = isKeyDown;
+                        break;
+                    default:
+                        // Not a modifier we care about — skip transition check
+                        goto done;
+                }
 
-                    bool bothHeld = ctrlHeld && altHeld;
+                bool ctrlHeld = lCtrlDown || rCtrlDown;
+                bool altHeld = lAltDown || rAltDown;
+                bool bothHeld = ctrlHeld && altHeld;
 
-                    if (bothHeld && !isShortcutActive)
-                    {
-                        isShortcutActive = true;
-                        ShortcutTransitionChanged?.Invoke(this, ShortcutTransition.Pressed);
-                    }
-                    else if (!bothHeld && isShortcutActive)
-                    {
-                        isShortcutActive = false;
-                        ShortcutTransitionChanged?.Invoke(this, ShortcutTransition.Released);
-                    }
+                if (bothHeld && !isShortcutActive)
+                {
+                    isShortcutActive = true;
+                    Debug.WriteLine($"[Clicky] Shortcut PRESSED (LCtrl={lCtrlDown} RCtrl={rCtrlDown} LAlt={lAltDown} RAlt={rAltDown})");
+                    ShortcutTransitionChanged?.Invoke(this, ShortcutTransition.Pressed);
+                }
+                else if (!bothHeld && isShortcutActive)
+                {
+                    isShortcutActive = false;
+                    Debug.WriteLine($"[Clicky] Shortcut RELEASED (LCtrl={lCtrlDown} RCtrl={rCtrlDown} LAlt={lAltDown} RAlt={rAltDown})");
+                    ShortcutTransitionChanged?.Invoke(this, ShortcutTransition.Released);
                 }
             }
         }
 
+        done:
         return NativeMethods.CallNextHookEx(hookId, nCode, wParam, lParam);
     }
 

@@ -44,6 +44,10 @@ public partial class CompanionManagerViewModel : INotifyPropertyChanged, IDispos
     private string selectedModel;
     private CancellationTokenSource? currentResponseCancellation;
 
+    // ── AssemblyAI session gates ────────────────────────────────────
+    private TaskCompletionSource<bool>? sessionBeganTcs;
+    private volatile bool isSessionReady; // true once AssemblyAI "Begin" received
+
     // ── Conversation History ────────────────────────────────────────
     private readonly List<ConversationEntry> conversationHistory = new();
     private const int MaxConversationHistoryEntries = 10;
@@ -97,6 +101,7 @@ public partial class CompanionManagerViewModel : INotifyPropertyChanged, IDispos
         {
             CurrentAudioPowerLevel = level;
         };
+        // Forward live audio to AssemblyAI as it arrives
         audioCaptureService.AudioDataAvailable += async (_, data) =>
         {
             try
@@ -106,6 +111,33 @@ public partial class CompanionManagerViewModel : INotifyPropertyChanged, IDispos
             catch (Exception ex)
             {
                 Debug.WriteLine($"[Clicky] Audio send error: {ex.Message}");
+            }
+        };
+        assemblyAiService.OnSessionBegan += (_, _) =>
+        {
+            Debug.WriteLine("[Clicky] AssemblyAI session began - ready to receive audio");
+            isSessionReady = true;
+            sessionBeganTcs?.TrySetResult(true);
+
+            // Flush any audio captured before the WebSocket was ready
+            var bufferedAudio = audioCaptureService.GetBufferedAudioSinceStart();
+            if (bufferedAudio.Length > 0)
+            {
+                Debug.WriteLine($"[Clicky] Flushing {bufferedAudio.Length} bytes of pre-connection audio");
+                _ = Task.Run(async () =>
+                {
+                    const int chunkSize = 4096;
+                    int offset = 0;
+                    while (offset < bufferedAudio.Length)
+                    {
+                        int size = Math.Min(chunkSize, bufferedAudio.Length - offset);
+                        var chunk = new byte[size];
+                        Array.Copy(bufferedAudio, offset, chunk, 0, size);
+                        await assemblyAiService.SendAudioDataAsync(chunk);
+                        offset += size;
+                    }
+                    Debug.WriteLine($"[Clicky] Pre-connection audio flushed");
+                });
             }
         };
         assemblyAiService.OnTranscriptUpdate += (_, transcript) =>
@@ -118,7 +150,7 @@ public partial class CompanionManagerViewModel : INotifyPropertyChanged, IDispos
         };
         assemblyAiService.OnFinalTranscriptReady += (_, transcript) =>
         {
-            Debug.WriteLine($"[Clicky] Final transcript: {transcript}");
+            Debug.WriteLine($"[Clicky] Final transcript: \"{transcript}\"");
             Application.Current.Dispatcher.Invoke(() =>
             {
                 _ = SendTranscriptToClaudeWithScreenshot(transcript);
@@ -143,6 +175,7 @@ public partial class CompanionManagerViewModel : INotifyPropertyChanged, IDispos
 
     public void Start()
     {
+        audioCaptureService.Initialize();
         globalHotkeyService.Start();
     }
 
@@ -158,31 +191,46 @@ public partial class CompanionManagerViewModel : INotifyPropertyChanged, IDispos
     private void OnShortcutTransitionChanged(object? sender, ShortcutTransition transition)
     {
         Debug.WriteLine($"[Clicky] Shortcut transition: {transition}");
-        Application.Current.Dispatcher.BeginInvoke(async () =>
-        {
-            try
-            {
-                switch (transition)
-                {
-                    case ShortcutTransition.Pressed:
-                        await HandleShortcutPressed();
-                        break;
 
-                    case ShortcutTransition.Released:
-                        await HandleShortcutReleased();
-                        break;
-                }
-            }
-            catch (Exception ex)
+        if (transition == ShortcutTransition.Pressed)
+        {
+            // Start capturing audio immediately on the hook thread
+            audioCaptureService.StartCapture();
+
+            Application.Current.Dispatcher.BeginInvoke(async () =>
             {
-                Debug.WriteLine($"[Clicky] Shortcut handler error: {ex}");
-            }
-        });
+                try
+                {
+                    await HandleShortcutPressed();
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Clicky] HandleShortcutPressed error: {ex}");
+                }
+            });
+        }
+        else if (transition == ShortcutTransition.Released)
+        {
+            // Stop capturing audio immediately on the hook thread
+            audioCaptureService.StopCapture();
+
+            Application.Current.Dispatcher.BeginInvoke(async () =>
+            {
+                try
+                {
+                    await HandleShortcutReleased();
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Clicky] HandleShortcutReleased error: {ex}");
+                }
+            });
+        }
     }
 
     private async Task HandleShortcutPressed()
     {
-        Debug.WriteLine("[Clicky] HandleShortcutPressed - starting mic and AssemblyAI");
+        Debug.WriteLine("[Clicky] HandleShortcutPressed");
 
         // Cancel any in-progress response
         currentResponseCancellation?.Cancel();
@@ -190,26 +238,57 @@ public partial class CompanionManagerViewModel : INotifyPropertyChanged, IDispos
 
         VoiceState = CompanionVoiceState.Listening;
         CurrentResponseText = null;
+        isSessionReady = false;
 
-        // Start mic capture and AssemblyAI streaming session
-        audioCaptureService.StartCapture();
-        Debug.WriteLine("[Clicky] Mic capture started");
+        // Connect to AssemblyAI WebSocket — audio will be buffered by
+        // AssemblyAiTranscriptionService until the session begins, then
+        // we flush the ring buffer's pre-connection audio via OnSessionBegan
+        sessionBeganTcs = new TaskCompletionSource<bool>();
 
-        var keyterms = new[] { "Claude", "Clicky", "Windows", "Visual Studio", "browser" };
-        await assemblyAiService.StartSessionAsync(keyterms);
-        Debug.WriteLine("[Clicky] AssemblyAI session started");
+        try
+        {
+            await assemblyAiService.StopSessionAsync();
+            var keyterms = new[] { "Claude", "Clicky", "Windows", "Visual Studio", "browser" };
+            await assemblyAiService.StartSessionAsync(keyterms);
+            Debug.WriteLine("[Clicky] AssemblyAI WebSocket connected, waiting for Begin...");
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[Clicky] Session setup error: {ex.Message}");
+            sessionBeganTcs.TrySetResult(false);
+        }
     }
 
     private async Task HandleShortcutReleased()
     {
-        Debug.WriteLine("[Clicky] HandleShortcutReleased - stopping mic, requesting transcript");
+        Debug.WriteLine("[Clicky] HandleShortcutReleased");
 
         VoiceState = CompanionVoiceState.Processing;
 
-        // Stop mic capture
-        audioCaptureService.StopCapture();
+        // Wait for AssemblyAI session to be ready (with timeout)
+        if (sessionBeganTcs != null && !isSessionReady)
+        {
+            Debug.WriteLine("[Clicky] Waiting for AssemblyAI session...");
+            var beganTask = sessionBeganTcs.Task;
+            if (await Task.WhenAny(beganTask, Task.Delay(5000)) != beganTask)
+            {
+                Debug.WriteLine("[Clicky] AssemblyAI session timed out");
+                VoiceState = CompanionVoiceState.Idle;
+                return;
+            }
+            if (!beganTask.Result)
+            {
+                Debug.WriteLine("[Clicky] AssemblyAI session failed");
+                VoiceState = CompanionVoiceState.Idle;
+                return;
+            }
+        }
 
-        // Request final transcript (AssemblyAI will fire OnFinalTranscriptReady)
+        // Give AssemblyAI time to process the streamed audio
+        Debug.WriteLine("[Clicky] Waiting for AssemblyAI to process audio...");
+        await Task.Delay(2000);
+
+        // Request final transcript
         await assemblyAiService.RequestFinalTranscriptAsync();
         Debug.WriteLine("[Clicky] Final transcript requested");
     }
@@ -249,6 +328,8 @@ public partial class CompanionManagerViewModel : INotifyPropertyChanged, IDispos
                     });
                 },
                 cancellationToken: currentResponseCancellation.Token);
+
+            Debug.WriteLine($"[Clicky] Claude response: \"{responseText[..Math.Min(100, responseText.Length)]}...\"");
 
             // Parse pointing coordinates from the response
             var pointingResult = ParsePointingCoordinates(responseText);
@@ -306,18 +387,15 @@ public partial class CompanionManagerViewModel : INotifyPropertyChanged, IDispos
 
     /// <summary>
     /// Parses [POINT:x,y:label] or [POINT:x,y:label:screenN] tags from Claude's response.
-    /// Port of the regex parsing from CompanionManager.swift line 784.
     /// </summary>
     public static PointingParseResult ParsePointingCoordinates(string responseText)
     {
-        // Match [POINT:none] — no pointing
         if (responseText.Contains("[POINT:none]"))
         {
             var spokenText = responseText.Replace("[POINT:none]", "").Trim();
             return new PointingParseResult(spokenText, null, null, null);
         }
 
-        // Match [POINT:x,y:label] or [POINT:x,y:label:screenN]
         var pattern = @"\[POINT:(\d+),(\d+):([^:\]]+)(?::screen(\d+))?\]";
         var match = Regex.Match(responseText, pattern);
 
@@ -338,7 +416,6 @@ public partial class CompanionManagerViewModel : INotifyPropertyChanged, IDispos
                 screenNumber);
         }
 
-        // No POINT tag found
         return new PointingParseResult(responseText, null, null, null);
     }
 
